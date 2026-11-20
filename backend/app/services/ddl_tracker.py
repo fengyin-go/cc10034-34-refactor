@@ -10,8 +10,9 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from app.services.base import BaseModuleService
+from app.ddl_insight import recognize_ddl
 from app.pipeline import DdlRecord, pipeline_bus
+from app.services.base import BaseModuleService
 
 
 class DdlTrackerService(BaseModuleService):
@@ -27,43 +28,14 @@ class DdlTrackerService(BaseModuleService):
     def analyze_ddl_impact(self, ddl: DdlRecord) -> dict[str, Any]:
         """分析DDL变更对目标表的影响范围。
 
-        解析 DDL 语句中的列变化、分区变化、索引变化，
+        表结构语句与分区动作统一由 recognize_ddl 识别，
         产出影响报告供 schema_sync 和 partition_sync 消费。
         """
-        ddl_text = ddl.ddl_statement.upper()
-        column_changes: list[dict[str, Any]] = []
-        partition_changes: list[dict[str, Any]] = []
-
-        # 检测 ADD COLUMN
-        add_cols = re.findall(r'ADD\s+COLUMN\s+(\w+)\s+(\w+)', ddl_text, re.IGNORECASE)
-        for col_name, col_type in add_cols:
-            column_changes.append({"action": "add", "column": col_name, "type": col_type})
-            ddl.column_changes.append({"action": "add", "column": col_name, "type": col_type})
-
-        # 检测 DROP COLUMN
-        drop_cols = re.findall(r'DROP\s+(?:COLUMN\s+)?(\w+)', ddl_text, re.IGNORECASE)
-        for col_name in drop_cols:
-            column_changes.append({"action": "drop", "column": col_name})
-            ddl.column_changes.append({"action": "drop", "column": col_name})
-
-        # 检测 MODIFY COLUMN / CHANGE COLUMN
-        modify_cols = re.findall(r'(?:MODIFY|CHANGE)\s+(?:COLUMN\s+)?(\w+)\s+(\w+)\s+(\w+)',
-                                 ddl_text, re.IGNORECASE)
-        for old_name, new_name, col_type in modify_cols:
-            column_changes.append({"action": "modify", "column": old_name, "new_type": col_type})
-            ddl.column_changes.append({"action": "modify", "column": old_name, "new_type": col_type})
-
-        # 检测 ADD PARTITION
-        add_part = re.findall(r'ADD\s+PARTITION', ddl_text, re.IGNORECASE)
-        if add_part:
-            partition_changes.append({"action": "add_partition"})
-            ddl.partition_changes.append({"action": "add_partition"})
-
-        # 检测 DROP PARTITION
-        drop_part = re.findall(r'DROP\s+PARTITION\s+(\w+)', ddl_text, re.IGNORECASE)
-        for part_name in drop_part:
-            partition_changes.append({"action": "drop_partition", "name": part_name})
-            ddl.partition_changes.append({"action": "drop_partition", "name": part_name})
+        insight = recognize_ddl(ddl.ddl_statement)
+        column_changes = insight.column_changes
+        partition_changes = insight.partition_changes
+        ddl.column_changes.extend(column_changes)
+        ddl.partition_changes.extend(partition_changes)
 
         affected_cols = len(column_changes)
         rollback = self.generate_rollback(ddl.ddl_statement)
@@ -76,8 +48,8 @@ class DdlTrackerService(BaseModuleService):
             "partition_changes": partition_changes,
             "affected_columns": affected_cols,
             "rollback_statement": rollback,
-            "has_schema_impact": len(column_changes) > 0,
-            "has_partition_impact": len(partition_changes) > 0,
+            "has_schema_impact": insight.has_schema_impact,
+            "has_partition_impact": insight.has_partition_impact,
             "analyzed_at": datetime.now().isoformat(),
         }
 
@@ -92,6 +64,9 @@ class DdlTrackerService(BaseModuleService):
                 })
 
         pipeline_bus.add_ddl(ddl)
+        # 登记共享 DDL 识别数据，partition_sync 按批次读取形成目标计划
+        if ddl.batch_id:
+            pipeline_bus.register_ddl_insight(ddl.batch_id, ddl)
         pipeline_bus.write_audit(
             "DDL分析", f"{ddl.database}.{ddl.table_name}",
             f"分析DDL影响：列变更{affected_cols}，分区变更{len(partition_changes)}",
@@ -128,19 +103,33 @@ class DdlTrackerService(BaseModuleService):
             return "ALTER TABLE ... DROP PARTITION ...;"
         return "-- 自动回滚生成中"
 
+    def record_ddl_batch(self, database: str, table_name: str,
+                         ddl_statements: list[str]) -> list[DdlRecord]:
+        """将同一轮登记的多条 DDL 登为一批。
+
+        同一批既包含普通改列，也包含同表的分区增删；
+        每条记录保留按顺序登记的来源编号。
+        """
+        batch_id = pipeline_bus.begin_ddl_batch()
+        records: list[DdlRecord] = []
+        for ddl_stmt in ddl_statements:
+            ddl = DdlRecord(
+                record_id=f"ddl_{uuid.uuid4().hex[:8]}",
+                database=database,
+                table_name=table_name,
+                ddl_statement=ddl_stmt,
+                executed_at=datetime.now(),
+                affected_columns=0,
+                rollback_statement=self.generate_rollback(ddl_stmt),
+                batch_id=batch_id,
+            )
+            self.analyze_ddl_impact(ddl)
+            records.append(ddl)
+        return records
+
     def record_ddl(self, database: str, table_name: str, ddl_stmt: str) -> DdlRecord:
         """记录并分析一条DDL。"""
-        ddl = DdlRecord(
-            record_id=f"ddl_{uuid.uuid4().hex[:8]}",
-            database=database,
-            table_name=table_name,
-            ddl_statement=ddl_stmt,
-            executed_at=datetime.now(),
-            affected_columns=0,
-            rollback_statement=self.generate_rollback(ddl_stmt),
-        )
-        self.analyze_ddl_impact(ddl)
-        return ddl
+        return self.record_ddl_batch(database, table_name, [ddl_stmt])[0]
 
     def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
         entry, msg = super().run_action(entry_id, action)

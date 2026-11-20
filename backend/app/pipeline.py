@@ -39,6 +39,26 @@ class DdlRecord:
     rollback_statement: str
     column_changes: list[dict[str, Any]] = field(default_factory=list)
     partition_changes: list[dict[str, Any]] = field(default_factory=list)
+    # 登记批次与来源编号 — ddl_tracker 按批次登记时写入
+    batch_id: str = ""
+    source_seq: int = 0
+
+
+@dataclass
+class DdlRegistration:
+    """DDL 识别登记：同一批次内按来源编号顺序保存的识别数据。
+
+    ddl_tracker 登记，partition_sync 按批次消费形成目标分区计划；
+    来源编号全管道递增，保证同批记录可按登记顺序续做。
+    """
+    source_seq: int
+    batch_id: str
+    record_id: str
+    database: str
+    table_name: str
+    column_changes: list[dict[str, Any]] = field(default_factory=list)
+    partition_changes: list[dict[str, Any]] = field(default_factory=list)
+    registered_at: datetime = field(default_factory=datetime.now)
 
 
 @dataclass
@@ -77,6 +97,10 @@ class PipelineBus:
         self.event_log: list[dict[str, Any]] = []
         # DDL 记录 — ddl_tracker 产出，schema_sync/partition_sync 消费
         self.ddl_log: list[DdlRecord] = []
+        # DDL 识别登记 — ddl_tracker 按批次登记，partition_sync 按批次消费
+        self.ddl_registrations: list[DdlRegistration] = []
+        self._ddl_source_seq = 0
+        self._ddl_batch_seq = 0
         # 位点注册 — checkpoint_manager/position_store 写入，cdc_channel/failover_group 消费
         self.positions: dict[str, PositionSnapshot] = {}
         self.checkpoints: list[CheckpointRecord] = []
@@ -156,6 +180,43 @@ class PipelineBus:
     def get_recent_ddls(self, limit: int = 50) -> list[DdlRecord]:
         """查询最近 DDL 记录。"""
         return self.ddl_log[-limit:]
+
+    def begin_ddl_batch(self) -> str:
+        """开启一轮新的 DDL 登记批次，返回批次号。"""
+        self._ddl_batch_seq += 1
+        return f"ddl_batch_{self._ddl_batch_seq:04d}"
+
+    def register_ddl_insight(self, batch_id: str, record: DdlRecord) -> DdlRegistration:
+        """登记一条 DDL 识别数据，来源编号按登记顺序递增。"""
+        self._ddl_source_seq += 1
+        record.source_seq = self._ddl_source_seq
+        registration = DdlRegistration(
+            source_seq=self._ddl_source_seq,
+            batch_id=batch_id,
+            record_id=record.record_id,
+            database=record.database,
+            table_name=record.table_name,
+            column_changes=[dict(change) for change in record.column_changes],
+            partition_changes=[dict(change) for change in record.partition_changes],
+        )
+        self.ddl_registrations.append(registration)
+        return registration
+
+    def get_ddl_batch(self, batch_id: str) -> list[DdlRegistration]:
+        """按来源编号顺序读取同一批次的登记。
+
+        只返回本批次的记录，不会混入其他批次后来登记的同表语句；
+        重复来源编号只保留首次登记，重复读取同批记录不会重复取到分区动作。
+        """
+        batch: list[DdlRegistration] = []
+        seen_seqs: set[int] = set()
+        for registration in self.ddl_registrations:
+            if registration.batch_id != batch_id or registration.source_seq in seen_seqs:
+                continue
+            seen_seqs.add(registration.source_seq)
+            batch.append(registration)
+        batch.sort(key=lambda registration: registration.source_seq)
+        return batch
 
     def compute_event_hash(self, event: ChangeEventRecord) -> str:
         """计算事件的业务去重哈希。"""
